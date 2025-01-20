@@ -146,9 +146,19 @@ If `--disable-host-loopback` is not specified, ports listening on 127.0.0.1 in t
 
 > **Note**
 > `--net=pasta` needs [pasta (passt)](https://passt.top/passt/) `2023_06_25.32660ce` or later.
+> Using `2023_12_04.b86afe3` or later is highly recommended.
 >
-> Depending on the version of pasta and the host operating system,
-> running `sudo apparmor_parser -R /etc/apparmor.d/usr.bin.passt` might be needed too.
+> Currently, this doesn't work with some Ubuntu versions of the passt
+> package:
+> - `passt-0.0~git20230627.289301b-1` (Ubuntu 23.10)
+> - `passt-0.0~git20240220.1e6f92b-1` (Ubuntu 24.04)
+> due to a missing `usr.bin.pasta` AppArmor profile, see:
+> https://bugs.launchpad.net/ubuntu/+source/passt/+bug/2077158
+>
+> Workaround: set the `kernel.apparmor_restrict_unprivileged_userns`
+> sysctl to `0`, or (preferred) add the AppArmor profile from
+> upstream, or from Debian packages, or from Ubuntu > 24.10.
+
 
 Pros:
 * Possible to perform network-namespaced operations, e.g. creating iptables rules, running `tcpdump`
@@ -157,7 +167,7 @@ Pros:
 * TCP port forwarding (`--port-driver=implicit`) can retain source IP addresses
 
 Cons:
-* UDP port forwarding is not supported yet
+* Lacks API for explicit port forwarding (`rootlessctl (list-ports|add-ports|remove-ports)`)
 
 The network configuration for pasta is similar to slirp4netns.
 As in `--net=slirp4netns`, specifying `--copy-up=/etc` and `--disable-host-loopback` is highly recommended.

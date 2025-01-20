@@ -34,19 +34,49 @@ var propagationStates = map[string]uintptr{
 	"rslave":   uintptr(unix.MS_REC | unix.MS_SLAVE),
 }
 
-func createCmd(targetCmd []string) (*exec.Cmd, error) {
-	var args []string
-	if len(targetCmd) > 1 {
-		args = targetCmd[1:]
+func setupFiles(cmd *exec.Cmd) {
+	// 0 1 and 2  are used for stdin. stdout, and stderr
+	const firstExtraFD = 3
+	systemdActivationFDs := 0
+	// check for systemd socket activation sockets
+	if v := os.Getenv("LISTEN_FDS"); v != "" {
+		if num, err := strconv.Atoi(v); err == nil {
+			systemdActivationFDs = num
+			cmd.ExtraFiles = make([]*os.File, systemdActivationFDs)
+		}
 	}
-	cmd := exec.Command(targetCmd[0], args...)
+	for fd := 0; fd < systemdActivationFDs; fd++ {
+		cmd.ExtraFiles[fd] = os.NewFile(uintptr(firstExtraFD+fd), "")
+	}
+}
+
+func createCmd(opt Opt) (*exec.Cmd, error) {
+	fixListenPidEnv, err := strconv.ParseBool(os.Getenv(opt.ChildUseActivationEnvKey))
+	if err != nil {
+		fixListenPidEnv = false
+	}
+	os.Unsetenv(opt.ChildUseActivationEnvKey)
+	targetCmd := opt.TargetCmd
+	var cmd *exec.Cmd
+	cmdEnv := os.Environ()
+	if fixListenPidEnv {
+		cmd = exec.Command("/proc/self/exe", os.Args[1:]...)
+		cmdEnv = append(cmdEnv, opt.RunActivationHelperEnvKey+"=true")
+	} else {
+		var args []string
+		if len(targetCmd) > 1 {
+			args = targetCmd[1:]
+		}
+		cmd = exec.Command(targetCmd[0], args...)
+	}
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = cmdEnv
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Pdeathsig: syscall.SIGKILL,
 	}
+	setupFiles(cmd)
 	return cmd, nil
 }
 
@@ -153,10 +183,23 @@ func setupCopyDir(driver copyup.ChildDriver, dirs []string) (bool, error) {
 	return false, nil
 }
 
+// setupNet sets up the network driver.
+//
+// NOTE: msg is altered during calling driver.ConfigureNetworkChild
 func setupNet(stateDir string, msg *messages.ParentInitNetworkDriverCompleted, etcWasCopied bool, driver network.ChildDriver, detachedNetNSPath string) error {
 	// HostNetwork
 	if driver == nil {
 		return nil
+	}
+
+	stateDirResolvConf := filepath.Join(stateDir, "resolv.conf")
+	hostsContent, err := generateEtcHosts()
+	if err != nil {
+		return err
+	}
+	stateDirHosts := filepath.Join(stateDir, "hosts")
+	if err := os.WriteFile(stateDirHosts, hostsContent, 0644); err != nil {
+		return fmt.Errorf("writing %s: %w", stateDirHosts, err)
 	}
 
 	if detachedNetNSPath == "" {
@@ -164,31 +207,40 @@ func setupNet(stateDir string, msg *messages.ParentInitNetworkDriverCompleted, e
 		if err := activateLoopback(); err != nil {
 			return err
 		}
-		dev, err := driver.ConfigureNetworkChild(msg, detachedNetNSPath)
+		dev, err := driver.ConfigureNetworkChild(msg, detachedNetNSPath) // alters msg
 		if err != nil {
 			return err
 		}
-		if err := activateDev(dev, msg.IP, msg.Netmask, msg.Gateway, msg.MTU); err != nil {
-			return err
+		if err := os.WriteFile(stateDirResolvConf, generateResolvConf(msg.DNS), 0644); err != nil {
+			return fmt.Errorf("writing %s: %w", stateDirResolvConf, err)
 		}
-		if etcWasCopied {
-			if err := writeResolvConf(msg.DNS); err != nil {
+		Info, _ := driver.ChildDriverInfo()
+		if !Info.ConfiguresInterface {
+			if err := activateDev(dev, msg.IP, msg.Netmask, msg.Gateway, msg.MTU); err != nil {
 				return err
 			}
-			if err := writeEtcHosts(); err != nil {
-				return err
+		}
+		if etcWasCopied {
+			// remove copied-up link
+			for _, f := range []string{"/etc/resolv.conf", "/etc/hosts"} {
+				if err := os.RemoveAll(f); err != nil {
+					return fmt.Errorf("failed to remove copied-up link %q: %w", f, err)
+				}
+				if err := os.WriteFile(f, []byte{}, 0644); err != nil {
+					return fmt.Errorf("writing %s: %w", f, err)
+				}
 			}
 		} else {
 			logrus.Warn("Mounting /etc/resolv.conf without copying-up /etc. " +
 				"Note that /etc/resolv.conf in the namespace will be unmounted when it is recreated on the host. " +
 				"Unless /etc/resolv.conf is statically configured, copying-up /etc is highly recommended. " +
 				"Please refer to RootlessKit documentation for further information.")
-			if err := mountResolvConf(stateDir, msg.DNS); err != nil {
-				return err
-			}
-			if err := mountEtcHosts(stateDir); err != nil {
-				return err
-			}
+		}
+		if err := unix.Mount(stateDirResolvConf, "/etc/resolv.conf", "", uintptr(unix.MS_BIND), ""); err != nil {
+			return fmt.Errorf("failed to create bind mount /etc/resolv.conf for %s: %w", stateDirResolvConf, err)
+		}
+		if err := unix.Mount(stateDirHosts, "/etc/hosts", "", uintptr(unix.MS_BIND), ""); err != nil {
+			return fmt.Errorf("failed to create bind mount /etc/hosts for %s: %w", stateDirHosts, err)
 		}
 	} else {
 		// detached mode
@@ -197,33 +249,41 @@ func setupNet(stateDir string, msg *messages.ParentInitNetworkDriverCompleted, e
 		}); err != nil {
 			return err
 		}
-		dev, err := driver.ConfigureNetworkChild(msg, detachedNetNSPath)
+		dev, err := driver.ConfigureNetworkChild(msg, detachedNetNSPath) // alters msg
 		if err != nil {
 			return err
 		}
+		if err := os.WriteFile(stateDirResolvConf, generateResolvConf(msg.DNS), 0644); err != nil {
+			return fmt.Errorf("writing %s: %w", stateDirResolvConf, err)
+		}
 		if err := ns.WithNetNSPath(detachedNetNSPath, func(_ ns.NetNS) error {
-			return activateDev(dev, msg.IP, msg.Netmask, msg.Gateway, msg.MTU)
+			Info, _ := driver.ChildDriverInfo()
+			if !Info.ConfiguresInterface {
+				return activateDev(dev, msg.IP, msg.Netmask, msg.Gateway, msg.MTU)
+			}
+			return nil
 		}); err != nil {
 			return err
 		}
-		// TODO: write /etc/resolv.conf and /etc/hosts in a custom directory?
 	}
 	return nil
 }
 
 type Opt struct {
-	PipeFDEnvKey    string              // needs to be set
-	StateDirEnvKey  string              // needs to be set
-	TargetCmd       []string            // needs to be set
-	NetworkDriver   network.ChildDriver // nil for HostNetwork
-	CopyUpDriver    copyup.ChildDriver  // cannot be nil if len(CopyUpDirs) != 0
-	CopyUpDirs      []string
-	DetachNetNS     bool
-	PortDriver      port.ChildDriver
-	MountProcfs     bool   // needs to be set if (and only if) parent.Opt.CreatePIDNS is set
-	Propagation     string // mount propagation type
-	Reaper          bool
-	EvacuateCgroup2 bool // needs to correspond to parent.Opt.EvacuateCgroup2 is set
+	PipeFDEnvKey              string              // needs to be set
+	RunActivationHelperEnvKey string              // needs to be set
+	ChildUseActivationEnvKey  string              // needs to be set
+	StateDirEnvKey            string              // needs to be set
+	TargetCmd                 []string            // needs to be set
+	NetworkDriver             network.ChildDriver // nil for HostNetwork
+	CopyUpDriver              copyup.ChildDriver  // cannot be nil if len(CopyUpDirs) != 0
+	CopyUpDirs                []string
+	DetachNetNS               bool
+	PortDriver                port.ChildDriver
+	MountProcfs               bool   // needs to be set if (and only if) parent.Opt.CreatePIDNS is set
+	Propagation               string // mount propagation type
+	Reaper                    bool
+	EvacuateCgroup2           bool // needs to correspond to parent.Opt.EvacuateCgroup2 is set
 }
 
 // statPIDNS is from https://github.com/containerd/containerd/blob/v1.7.2/services/introspection/pidns_linux.go#L25-L36
@@ -419,7 +479,7 @@ func Child(opt Opt) error {
 		}()
 	}
 
-	cmd, err := createCmd(opt.TargetCmd)
+	cmd, err := createCmd(opt)
 	if err != nil {
 		return err
 	}

@@ -29,22 +29,23 @@ import (
 )
 
 type Opt struct {
-	PipeFDEnvKey     string               // needs to be set
-	StateDir         string               // directory needs to be precreated
-	StateDirEnvKey   string               // optional env key to propagate StateDir value
-	NetworkDriver    network.ParentDriver // nil for HostNetwork
-	PortDriver       port.ParentDriver    // nil for --port-driver=none
-	PublishPorts     []port.Spec
-	CreatePIDNS      bool
-	CreateCgroupNS   bool
-	CreateUTSNS      bool
-	CreateIPCNS      bool
-	DetachNetNS      bool
-	ParentEUIDEnvKey string // optional env key to propagate geteuid() value
-	ParentEGIDEnvKey string // optional env key to propagate getegid() value
-	Propagation      string
-	EvacuateCgroup2  string // e.g. "rootlesskit_evacuation"
-	SubidSource      SubidSource
+	PipeFDEnvKey             string               // needs to be set
+	ChildUseActivationEnvKey string               // needs to be set
+	StateDir                 string               // directory needs to be precreated
+	StateDirEnvKey           string               // optional env key to propagate StateDir value
+	NetworkDriver            network.ParentDriver // nil for HostNetwork
+	PortDriver               port.ParentDriver    // nil for --port-driver=none
+	PublishPorts             []port.Spec
+	CreatePIDNS              bool
+	CreateCgroupNS           bool
+	CreateUTSNS              bool
+	CreateIPCNS              bool
+	DetachNetNS              bool
+	ParentEUIDEnvKey         string // optional env key to propagate geteuid() value
+	ParentEGIDEnvKey         string // optional env key to propagate getegid() value
+	Propagation              string
+	EvacuateCgroup2          string // e.g. "rootlesskit_evacuation"
+	SubidSource              SubidSource
 }
 
 type SubidSource string
@@ -125,6 +126,28 @@ func LockStateDir(stateDir string) (*flock.Flock, error) {
 	return lock, nil
 }
 
+func setupFilesAndEnv(readPipe *os.File, writePipe *os.File, opt Opt) ([]*os.File, []string) {
+	// 0 1 and 2  are used for stdin. stdout, and stderr
+	const listenFdsStart = 3
+	listenPid, listenPidErr := strconv.Atoi(os.Getenv("LISTEN_PID"))
+	listenFds, listenFdsErr := strconv.Atoi(os.Getenv("LISTEN_FDS"))
+	useSystemdSocketFDs := listenPidErr == nil && listenFdsErr == nil && listenFds > 0
+	if !useSystemdSocketFDs {
+		listenFds = 0
+	}
+	extraFiles := make([]*os.File, listenFds+2)
+	for i, fd := 0, listenFdsStart; i < listenFds; i, fd = i+1, fd+1 {
+		name := "LISTEN_FD_" + strconv.Itoa(fd)
+		extraFiles[i] = os.NewFile(uintptr(fd), name)
+	}
+	extraFiles[listenFds] = readPipe
+	extraFiles[listenFds+1] = writePipe
+	cmdEnv := os.Environ()
+	cmdEnv = append(cmdEnv, opt.PipeFDEnvKey+"="+strconv.Itoa(listenFdsStart+listenFds)+","+strconv.Itoa(listenFdsStart+listenFds+1))
+	cmdEnv = append(cmdEnv, opt.ChildUseActivationEnvKey+"="+strconv.FormatBool(listenPid == os.Getpid()))
+	return extraFiles, cmdEnv
+}
+
 func Parent(opt Opt) error {
 	if err := checkPreflight(opt); err != nil {
 		return err
@@ -178,8 +201,7 @@ func Parent(opt Opt) error {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.ExtraFiles = []*os.File{pipeR, pipe2W}
-	cmd.Env = append(os.Environ(), opt.PipeFDEnvKey+"=3,4")
+	cmd.ExtraFiles, cmd.Env = setupFilesAndEnv(pipeR, pipe2W, opt)
 	if opt.StateDirEnvKey != "" {
 		cmd.Env = append(cmd.Env, opt.StateDirEnvKey+"="+opt.StateDir)
 	}
@@ -190,6 +212,7 @@ func Parent(opt Opt) error {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", opt.ParentEGIDEnvKey, os.Getegid()))
 	}
 	if err := cmd.Start(); err != nil {
+		warnOnChildStartFailure(err)
 		return fmt.Errorf("failed to start the child: %w", err)
 	}
 
