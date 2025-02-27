@@ -17,8 +17,37 @@ import (
 	"github.com/rootless-containers/rootlesskit/v2/pkg/messages"
 	"github.com/rootless-containers/rootlesskit/v2/pkg/network"
 	"github.com/rootless-containers/rootlesskit/v2/pkg/network/iputils"
-	"github.com/rootless-containers/rootlesskit/v2/pkg/network/parentutils"
 )
+
+type Features struct {
+	// Has `--host-lo-to-ns-lo` (introduced in passt 2024_10_30.ee7d0b6)
+	// https://passt.top/passt/commit/?id=b4dace8f462b346ae2135af1f8d681a99a849a5f
+	HasHostLoToNsLo bool
+}
+
+func DetectFeatures(binary string) (*Features, error) {
+	if binary == "" {
+		return nil, errors.New("got empty pasta binary")
+	}
+	realBinary, err := exec.LookPath(binary)
+	if err != nil {
+		return nil, fmt.Errorf("pasta binary %q is not installed: %w", binary, err)
+	}
+	cmd := exec.Command(realBinary, "--version")
+	b, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf(`command "%s --version" failed, make sure pasta is installed: %q: %w`,
+			realBinary, string(b), err)
+	}
+	f := Features{
+		HasHostLoToNsLo: false,
+	}
+	cmd = exec.Command(realBinary, "--host-lo-to-ns-lo", "--version")
+	if cmd.Run() == nil {
+		f.HasHostLoToNsLo = true
+	}
+	return &f, nil
+}
 
 // NewParentDriver instantiates new parent driver.
 func NewParentDriver(logWriter io.Writer, binary string, mtu int, ipnet *net.IPNet, ifname string,
@@ -45,6 +74,11 @@ func NewParentDriver(logWriter io.Writer, binary string, mtu int, ipnet *net.IPN
 		ifname = "tap0"
 	}
 
+	feat, err := DetectFeatures(binary)
+	if err != nil {
+		return nil, err
+	}
+
 	return &parentDriver{
 		logWriter:              logWriter,
 		binary:                 binary,
@@ -54,6 +88,7 @@ func NewParentDriver(logWriter io.Writer, binary string, mtu int, ipnet *net.IPN
 		enableIPv6:             enableIPv6,
 		ifname:                 ifname,
 		implicitPortForwarding: implicitPortForwarding,
+		feat:                   feat,
 	}, nil
 }
 
@@ -68,6 +103,7 @@ type parentDriver struct {
 	infoMu                 sync.RWMutex
 	implicitPortForwarding bool
 	info                   func() *api.NetworkDriverInfo
+	feat                   *Features
 }
 
 const DriverName = "pasta"
@@ -92,9 +128,6 @@ func (d *parentDriver) MTU() int {
 func (d *parentDriver) ConfigureNetwork(childPID int, stateDir, detachedNetNSPath string) (*messages.ParentInitNetworkDriverCompleted, func() error, error) {
 	tap := d.ifname
 	var cleanups []func() error
-	if err := parentutils.PrepareTap(childPID, detachedNetNSPath, tap); err != nil {
-		return nil, common.Seq(cleanups), fmt.Errorf("setting up tap %s: %w", tap, err)
-	}
 
 	address, err := iputils.AddIPInt(d.ipnet.IP, 100)
 	if err != nil {
@@ -111,12 +144,10 @@ func (d *parentDriver) ConfigureNetwork(childPID int, stateDir, detachedNetNSPat
 	}
 
 	opts := []string{
-		"--foreground",
 		"--stderr",
 		"--ns-ifname=" + d.ifname,
 		"--mtu=" + strconv.Itoa(d.mtu),
-		"--no-dhcp",
-		"--no-ra",
+		"--config-net",
 		"--address=" + address.String(),
 		"--netmask=" + strconv.Itoa(netmask),
 		"--gateway=" + gateway.String(),
@@ -131,10 +162,18 @@ func (d *parentDriver) ConfigureNetwork(childPID int, stateDir, detachedNetNSPat
 	if d.implicitPortForwarding {
 		opts = append(opts, "--tcp-ports=auto",
 			"--udp-ports=auto")
-		// TCP ports are periodically watched, but UDP ports are not.
 	} else {
 		opts = append(opts, "--tcp-ports=none",
 			"--udp-ports=none")
+	}
+	if d.feat != nil {
+		if d.feat.HasHostLoToNsLo {
+			// Needed to keep `docker run -p 127.0.0.1:8080:80` functional with
+			// passt >= 2024_10_30.ee7d0b6
+			//
+			// https://github.com/rootless-containers/rootlesskit/pull/482#issuecomment-2591798590
+			opts = append(opts, "--host-lo-to-ns-lo")
+		}
 	}
 	if detachedNetNSPath == "" {
 		opts = append(opts, strconv.Itoa(childPID))
@@ -144,24 +183,27 @@ func (d *parentDriver) ConfigureNetwork(childPID int, stateDir, detachedNetNSPat
 			"--netns="+detachedNetNSPath)
 	}
 
-	// FIXME: Doesn't work with passt_0.0~git20230216.4663ccc-1_amd64.deb (Ubuntu 23.04)
-	// `Couldn't open user namespace /proc/51813/ns/user: Permission denied`
-	// Possibly related to AppArmor.
+	// FIXME: Doesn't work with:
+	// - passt-0.0~git20230627.289301b-1 (Ubuntu 23.10)
+	// - passt-0.0~git20240220.1e6f92b-1 (Ubuntu 24.04)
+	// see https://bugs.launchpad.net/ubuntu/+source/passt/+bug/2077158
+	//
+	// Workaround: set the kernel.apparmor_restrict_unprivileged_userns
+	// sysctl to 0, or (preferred) add the AppArmor profile from upstream,
+	// or from Debian packages, or from Ubuntu > 24.10.
 	cmd := exec.Command(d.binary, opts...)
-	cmd.Stdout = d.logWriter
-	cmd.Stderr = d.logWriter
-	cleanups = append(cleanups, func() error {
-		logrus.Debugf("killing pasta")
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+	logrus.Debugf("Executing %v", cmd.Args)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		exitErr := &exec.ExitError{}
+		if errors.As(err, &exitErr) {
+			return nil, common.Seq(cleanups),
+				fmt.Errorf("pasta failed with exit code %d:\n%s",
+					exitErr.ExitCode(), string(out))
 		}
-		wErr := cmd.Wait()
-		logrus.Debugf("killed pasta: %v", wErr)
-		return nil
-	})
-	if err := cmd.Start(); err != nil {
 		return nil, common.Seq(cleanups), fmt.Errorf("executing %v: %w", cmd, err)
 	}
+
 	netmsg := messages.ParentInitNetworkDriverCompleted{
 		Dev: tap,
 		MTU: d.mtu,
@@ -169,13 +211,13 @@ func (d *parentDriver) ConfigureNetwork(childPID int, stateDir, detachedNetNSPat
 	netmsg.IP = address.String()
 	netmsg.Netmask = netmask
 	netmsg.Gateway = gateway.String()
-	netmsg.DNS = dns.String()
+	netmsg.DNS = []string{dns.String()}
 
 	d.infoMu.Lock()
 	d.info = func() *api.NetworkDriverInfo {
 		return &api.NetworkDriverInfo{
 			Driver:         DriverName,
-			DNS:            []net.IP{net.ParseIP(netmsg.DNS)},
+			DNS:            []net.IP{net.ParseIP(netmsg.DNS[0])},
 			ChildIP:        net.ParseIP(netmsg.IP),
 			DynamicChildIP: false,
 		}
@@ -189,6 +231,12 @@ func NewChildDriver() network.ChildDriver {
 }
 
 type childDriver struct {
+}
+
+func (d *childDriver) ChildDriverInfo() (*network.ChildDriverInfo, error) {
+	return &network.ChildDriverInfo{
+		ConfiguresInterface: true,
+	}, nil
 }
 
 func (d *childDriver) ConfigureNetworkChild(netmsg *messages.ParentInitNetworkDriverCompleted, detachedNetNSPath string) (string, error) {

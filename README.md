@@ -67,7 +67,7 @@ Run `make && sudo make install` .
 The following binaries will be installed:
 - `/usr/local/bin/rootlesskit`
 - `/usr/local/bin/rootlessctl`
-- `/usr/local/bin/rootlesskit-docker-proxy` (Can be safely removed if you do not use Docker)
+- `/usr/local/bin/rootlesskit-docker-proxy` (DEPRECATED; Only required for Docker prior to [v28](https://github.com/moby/moby/pull/48132/commits/dac7ffa3404138a4f291c16586e5a2c68dad4151))
 
 ### Requirements
 
@@ -239,7 +239,9 @@ The following files will be created in the state directory, which can be specifi
 * `lock`: lock file
 * `child_pid`: decimal PID text that can be used for `nsenter(1)`.
 * `api.sock`: REST API socket. See [`./docs/api.md`](./docs/api.md) and [`./docs/port.md`](./docs/port.md).
-* `netns`: Detached NetNS. Created only with `--detach-netns`. Valid only in the child mount namespace.
+* `netns` (since v2.0.0): Detached NetNS. Created only with `--detach-netns`. Valid only in the child mount namespace.
+* `resolv.conf` (since v2.0.0): `resolv.conf` file. Bind-mounted to `/etc/resolv.conf` unles `--detach-netns` is specified.
+* `hosts` (since v2.0.0): `hosts` file. Bind-mounted to `/etc/hosts` unless `--detach-netns` is specified.
 
 If `--state-dir` is not specified, RootlessKit creates a temporary state directory on `/tmp` and removes it on exit.
 

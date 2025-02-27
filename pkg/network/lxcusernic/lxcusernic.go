@@ -148,6 +148,12 @@ func exchangeDHCP(c *client4.Client, dev string, detachedNetNSPath string) (*dhc
 	return ack, nil
 }
 
+func (d *childDriver) ChildDriverInfo() (*network.ChildDriverInfo, error) {
+	return &network.ChildDriverInfo{
+		ConfiguresInterface: false,
+	}, nil
+}
+
 func (d *childDriver) ConfigureNetworkChild(netmsg *messages.ParentInitNetworkDriverCompleted, detachedNetNSPath string) (string, error) {
 	dev := netmsg.Dev
 	if dev == "" {
@@ -184,7 +190,7 @@ func (d *childDriver) ConfigureNetworkChild(netmsg *messages.ParentInitNetworkDr
 	netmask, _ := p.SubnetMask().Size()
 	netmsg.Netmask = netmask
 	netmsg.Gateway = p.Router()[0].To4().String()
-	netmsg.DNS = p.DNS()[0].To4().String()
+	netmsg.DNS = []string{p.DNS()[0].To4().String()}
 	go dhcpRenewRoutine(c, dev, p.YourIPAddr.To4(), p.IPAddressLeaseTime(time.Hour), detachedNetNSPath)
 	return dev, nil
 }
