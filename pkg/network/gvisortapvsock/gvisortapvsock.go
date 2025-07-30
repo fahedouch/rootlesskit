@@ -96,6 +96,13 @@ func (d *parentDriver) MTU() int {
 	return d.mtu
 }
 
+// GetVirtualNetwork returns the virtual network used by this driver
+func (d *parentDriver) GetVirtualNetwork() *virtualnetwork.VirtualNetwork {
+	d.vnMu.RLock()
+	defer d.vnMu.RUnlock()
+	return d.vn
+}
+
 // setupNetworkConfig sets up the basic network configuration
 func (d *parentDriver) setupNetworkConfig() (ip string, gateway string, netmask int, err error) {
 
