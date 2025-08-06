@@ -15,14 +15,9 @@ import (
 	"github.com/containers/gvisor-tap-vsock/pkg/types"
 	"github.com/containers/gvisor-tap-vsock/pkg/virtualnetwork"
 	"github.com/rootless-containers/rootlesskit/v2/pkg/api"
-	"github.com/rootless-containers/rootlesskit/v2/pkg/network/gvisortapvsock"
 	"github.com/rootless-containers/rootlesskit/v2/pkg/port"
 	"github.com/sirupsen/logrus"
 )
-
-// We use gvisortapvsock.GetVirtualNetwork() to get the virtual network
-// This allows us to reuse the same virtual network for all port forwarding operations
-// instead of creating a new one for each port driver instance
 
 // NewParentDriver creates a new parent driver using gvisor-tap-vsock for port forwarding.
 func NewParentDriver(logWriter io.Writer, stateDir string) (port.ParentDriver, error) {
@@ -63,7 +58,8 @@ func (d *driver) exposePort(protocol types.TransportProtocol, local, remote stri
 	}
 
 	// Create an HTTP request
-	httpReq, err := http.NewRequest(http.MethodPost, "/expose", &buf)
+	// The endpoint is /forwarder/expose as the handler is registered with a prefix
+	httpReq, err := http.NewRequest(http.MethodPost, "/forwarder/expose", &buf)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -109,7 +105,8 @@ func (d *driver) unexposePort(protocol types.TransportProtocol, local string) er
 	}
 
 	// Create an HTTP request
-	httpReq, err := http.NewRequest(http.MethodPost, "/unexpose", &buf)
+	// The endpoint is /forwarder/unexpose as the handler is registered with a prefix
+	httpReq, err := http.NewRequest(http.MethodPost, "/forwarder/unexpose", &buf)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -193,22 +190,16 @@ func (d *driver) RunParentDriver(initComplete chan struct{}, quit <-chan struct{
 		}
 	}
 
-	var err error
-
-	// Get the virtual network from the network driver
-	d.virtualNet = gvisortapvsock.GetVirtualNetwork()
-	if d.virtualNet != nil {
-		logrus.Debugf("Using virtual network from network driver")
-	} else {
-		// Create a new virtual network if the network driver's virtual network is not available
-		// This should not happen in normal operation, but we keep it as a fallback
-		logrus.Warnf("Network driver's virtual network not available, creating a new one")
-		d.virtualNet, err = virtualnetwork.New(config)
-		if err != nil {
-			d.mu.Unlock()
-			return fmt.Errorf("failed to create virtual network: %w", err)
+	// Get the virtual network from the child context
+	if cctx != nil && cctx.Network != nil {
+		if vn, ok := cctx.Network.(*virtualnetwork.VirtualNetwork); ok {
+			d.virtualNet = vn
+			logrus.Debugf("Using virtual network from child context")
 		}
-		logrus.Debugf("Created new virtual network")
+	}
+
+	if d.virtualNet == nil {
+		return fmt.Errorf("Virtual network not available in child context")
 	}
 
 	// Get the services mux from the virtual network
